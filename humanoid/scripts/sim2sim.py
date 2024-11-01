@@ -35,14 +35,91 @@ from tqdm import tqdm
 from collections import deque
 from scipy.spatial.transform import Rotation as R
 from humanoid import LEGGED_GYM_ROOT_DIR
-from humanoid.envs import XBotLCfg
+from humanoid.envs import XBotLCfg,XBotLNoArmsCfg
 import torch
+from pynput import keyboard
+import threading,time
 
+
+class KeyboardThread(threading.Thread):
+    def __init__(self):
+        super().__init__()
+        self.lock = threading.Lock()
+        self.target_vel_x = 0.0
+        self.target_vel_y = 0.0
+        self.target_ang_vel_yaw = 0.0
+        self.running = True
+
+        # 初始化监听器
+        self.listener = keyboard.Listener(
+            on_press=self.on_press,
+            on_release=self.on_release
+        )
+
+    def on_press(self, key):
+        try:
+            with self.lock:
+                if  key.char == 'w':
+                    self.target_vel_x = min(self.target_vel_x + 0.1, 1)  # 前进速度
+                    # print(f"self.target_vel_x :{self.target_vel_x}")
+                elif key.char == 's':
+                    self.target_vel_x = max(self.target_vel_x - 0.1, -1)  # 后退速度
+                elif key.char == 'a':
+                    self.target_vel_y = min(self.target_vel_y + 0.1, 0.5)   # 左平移
+                elif key.char == 'd':
+                    self.target_vel_y = max(self.target_vel_y - 0.1, -0.5)  # 右平移
+                elif key.char == 'e':
+                    self.target_ang_vel_yaw = -0.5  # 左转速度
+                elif key.char == 'q':
+                    self.target_ang_vel_yaw = 0.5  # 右转速度
+                elif key.char == 'r': 
+                    self.target_vel_x = 0.0
+                    self.target_vel_y = 0.0
+                    self.target_ang_vel_yaw = 0.0
+        except AttributeError:
+            pass
+
+    def on_release(self, key):
+        try:
+            with self.lock:
+                if key.char == 'e' or key.char == 'q':
+                    self.target_ang_vel_yaw = 0.0  # 松开 e 或 q 时重置角速度
+        except AttributeError:
+            pass
+
+    def run(self):
+        self.listener.start()
+        while self.running:
+            time.sleep(0.001)  # ✅ 释放CPU资源
+
+    def get_velocity(self):
+        with self.lock:
+            return self.target_vel_x, self.target_vel_y,self.target_ang_vel_yaw
+
+    def stop(self):
+        self.running = False
+        self.listener.stop()
+        self.join()
 
 class cmd:
     vx = 0.4
     vy = 0.0
     dyaw = 0.0
+
+def  _get_phase(cfg):
+    cycle_time = cfg.rewards.cycle_time
+
+    # print(f"self.gait_start:{self.gait_start}")
+    if self.cfg.commands.sw_switch:
+        stand_command = (torch.norm(self.commands[:, :2], dim=1) <= self.cfg.commands.stand_com_threshold)
+        self.phase_length_buf[stand_command] = 0 # set this as 0 for which env is standing
+        # self.gait_start is rand 0 or 0.5
+        phase = (self.phase_length_buf * self.dt / cycle_time ) * (~stand_command)
+        # print(f"phase:{phase}")
+    else:
+        phase = self.episode_length_buf * self.dt / cycle_time 
+        # print(f"phase:{phase}")
+        return phase
 
 
 def quaternion_to_euler_array(quat):
@@ -95,6 +172,8 @@ def run_mujoco(policy, cfg):
     Returns:
         None
     """
+    keyboard_thread = KeyboardThread()
+    keyboard_thread.start()
     model = mujoco.MjModel.from_xml_path(cfg.sim_config.mujoco_model_path)
     model.opt.timestep = cfg.sim_config.dt
     data = mujoco.MjData(model)
@@ -109,27 +188,32 @@ def run_mujoco(policy, cfg):
         hist_obs.append(np.zeros([1, cfg.env.num_single_obs], dtype=np.double))
 
     count_lowlevel = 0
+    move_lowlevel =  0
 
 
     for _ in tqdm(range(int(cfg.sim_config.sim_duration / cfg.sim_config.dt)), desc="Simulating..."):
 
         # Obtain an observation
+
         q, dq, quat, v, omega, gvec = get_obs(data)
         q = q[-cfg.env.num_actions:]
         dq = dq[-cfg.env.num_actions:]
-
+        
         # 1000hz -> 100hz
         if count_lowlevel % cfg.sim_config.decimation == 0:
 
+            vel_x,vel_y,ang_vel_yaw = keyboard_thread.get_velocity()
+            print(f"vel_x:{vel_x}, vel_y:{vel_y},ang_vel_yaw:{ang_vel_yaw}")
             obs = np.zeros([1, cfg.env.num_single_obs], dtype=np.float32)
             eu_ang = quaternion_to_euler_array(quat)
             eu_ang[eu_ang > math.pi] -= 2 * math.pi
-
-            obs[0, 0] = math.sin(2 * math.pi * count_lowlevel * cfg.sim_config.dt  / 0.64)
-            obs[0, 1] = math.cos(2 * math.pi * count_lowlevel * cfg.sim_config.dt  / 0.64)
-            obs[0, 2] = cmd.vx * cfg.normalization.obs_scales.lin_vel
-            obs[0, 3] = cmd.vy * cfg.normalization.obs_scales.lin_vel
-            obs[0, 4] = cmd.dyaw * cfg.normalization.obs_scales.ang_vel
+            if math.sqrt(vel_x*vel_x+vel_y*vel_y)<cfg.commands.stand_com_threshold:
+                move_lowlevel = 0
+            obs[0, 0] = math.sin(2 * math.pi * move_lowlevel * cfg.sim_config.dt  / 0.64)
+            obs[0, 1] = math.cos(2 * math.pi * move_lowlevel * cfg.sim_config.dt  / 0.64)
+            obs[0, 2] = vel_x * cfg.normalization.obs_scales.lin_vel
+            obs[0, 3] = vel_y * cfg.normalization.obs_scales.lin_vel
+            obs[0, 4] = ang_vel_yaw * cfg.normalization.obs_scales.ang_vel
             obs[0, 5:17] = q * cfg.normalization.obs_scales.dof_pos
             obs[0, 17:29] = dq * cfg.normalization.obs_scales.dof_vel
             obs[0, 29:41] = action
@@ -160,6 +244,7 @@ def run_mujoco(policy, cfg):
         mujoco.mj_step(model, data)
         viewer.render()
         count_lowlevel += 1
+        move_lowlevel += 1
 
     viewer.close()
 
@@ -173,7 +258,7 @@ if __name__ == '__main__':
     parser.add_argument('--terrain', action='store_true', help='terrain or plane')
     args = parser.parse_args()
 
-    class Sim2simCfg(XBotLCfg):
+    class Sim2simCfg(XBotLNoArmsCfg):
 
         class sim_config:
             if args.terrain:

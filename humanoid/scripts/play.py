@@ -43,9 +43,74 @@ from isaacgym.torch_utils import *
 import torch
 from tqdm import tqdm
 from datetime import datetime
+from pynput import keyboard
+import threading,time
+
+
+class KeyboardThread(threading.Thread):
+    def __init__(self):
+        super().__init__()
+        self.lock = threading.Lock()
+        self.target_vel_x = 0.0
+        self.target_vel_y = 0.0
+        self.target_ang_vel_yaw = 0.0
+        self.running = True
+
+        # 初始化监听器
+        self.listener = keyboard.Listener(
+            on_press=self.on_press,
+            on_release=self.on_release
+        )
+
+    def on_press(self, key):
+        try:
+            with self.lock:
+                if  key.char == 'w':
+                    self.target_vel_x = min(self.target_vel_x + 0.1, 1)  # 前进速度
+                    # print(f"self.target_vel_x :{self.target_vel_x}")
+                elif key.char == 's':
+                    self.target_vel_x = max(self.target_vel_x - 0.1, -1)  # 后退速度
+                elif key.char == 'a':
+                    self.target_vel_y = min(self.target_vel_y + 0.1, 0.5)   # 左平移
+                elif key.char == 'd':
+                    self.target_vel_y = max(self.target_vel_y - 0.1, -0.5)  # 右平移
+                elif key.char == 'e':
+                    self.target_ang_vel_yaw = -0.5  # 左转速度
+                elif key.char == 'q':
+                    self.target_ang_vel_yaw = 0.5  # 右转速度
+                elif key.char == 'r': 
+                    self.target_vel_x = 0.0
+                    self.target_vel_y = 0.0
+                    self.target_ang_vel_yaw = 0.0
+        except AttributeError:
+            pass
+
+    def on_release(self, key):
+        try:
+            with self.lock:
+                if key.char == 'e' or key.char == 'q':
+                    self.target_ang_vel_yaw = 0.0  # 松开 e 或 q 时重置角速度
+        except AttributeError:
+            pass
+
+    def run(self):
+        self.listener.start()
+        while self.running:
+            time.sleep(0.001)  # ✅ 释放CPU资源
+
+    def get_velocity(self):
+        with self.lock:
+            return self.target_vel_x, self.target_vel_y,self.target_ang_vel_yaw
+
+    def stop(self):
+        self.running = False
+        self.listener.stop()
+        self.join()
 
 
 def play(args):
+    keyboard_thread = KeyboardThread()
+    keyboard_thread.start()
     env_cfg, train_cfg = task_registry.get_cfgs(name=args.task)
     # override some parameters for testing
     env_cfg.env.num_envs = min(env_cfg.env.num_envs, 1)
@@ -56,8 +121,8 @@ def play(args):
     env_cfg.terrain.num_cols = 5
     env_cfg.terrain.curriculum = False     
     env_cfg.terrain.max_init_terrain_level = 5
-    env_cfg.noise.add_noise = True
-    env_cfg.domain_rand.push_robots = False 
+    env_cfg.noise.add_noise = False
+    env_cfg.domain_rand.push_robots = False
     env_cfg.domain_rand.joint_angle_noise = 0.
     env_cfg.noise.curriculum = False
     env_cfg.noise.noise_level = 0.5
@@ -86,13 +151,13 @@ def play(args):
     logger = Logger(env.dt)
     robot_index = 0 # which robot is used for logging
     joint_index = 1 # which joint is used for logging
-    stop_state_log = 1200 # number of steps before plotting states
+    stop_state_log = 20000 # number of steps before plotting states
     if RENDER:
         camera_properties = gymapi.CameraProperties()
         camera_properties.width = 1920
         camera_properties.height = 1080
         h1 = env.gym.create_camera_sensor(env.envs[0], camera_properties)
-        camera_offset = gymapi.Vec3(1, -1, 0.5)
+        camera_offset = gymapi.Vec3(0, 0, 0.5)
         camera_rotation = gymapi.Quat.from_axis_angle(gymapi.Vec3(-0.3, 0.2, 1),
                                                     np.deg2rad(135))
         actor_handle = env.gym.get_actor_handle(env.envs[0], 0)
@@ -111,18 +176,23 @@ def play(args):
         if not os.path.exists(experiment_dir):
             os.mkdir(experiment_dir)
         video = cv2.VideoWriter(dir, fourcc, 50.0, (1920, 1080))
-
+    vel_x = 0.0
+    vel_y = 0.0
     for i in tqdm(range(stop_state_log)):
 
         actions = policy(obs.detach()) # * 0.
+
+        vel_x,vel_y,ang_vel_yaw = keyboard_thread.get_velocity()
+        print(f"vel_x:{vel_x}, vel_y:{vel_y},ang_vel_yaw:{ang_vel_yaw}")
         
         if FIX_COMMAND:
-            env.commands[:, 0] = 0.5    # 1.0
-            env.commands[:, 1] = 0.
-            env.commands[:, 2] = 0.
+            env.commands[:, 0] = vel_x  # 1.0
+            env.commands[:, 1] = vel_y
+            env.commands[:, 2] = ang_vel_yaw
             env.commands[:, 3] = 0.
 
         obs, critic_obs, rews, dones, infos = env.step(actions.detach())
+        # print(f"obs:{obs[:,2:5]}")
 
         if RENDER:
             env.gym.fetch_results(env.sim, True)
@@ -160,6 +230,7 @@ def play(args):
     
     if RENDER:
         video.release()
+    keyboard_thread.stop()
 
 if __name__ == '__main__':
     EXPORT_POLICY = True
