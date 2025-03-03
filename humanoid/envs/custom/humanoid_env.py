@@ -213,6 +213,8 @@ class XBotLFreeEnv(LeggedRobot):
         """
         noise_vec = torch.zeros(
             self.cfg.env.num_single_obs, device=self.device)
+        # print(f"num_single_obs:{self.cfg.env.num_single_obs}")
+        
         self.add_noise = self.cfg.noise.add_noise
         noise_scales = self.cfg.noise.noise_scales
         noise_vec[0: 5] = 0.  # commands
@@ -221,6 +223,7 @@ class XBotLFreeEnv(LeggedRobot):
         noise_vec[41: 59] = 0.  # previous actions
         noise_vec[59: 62] = noise_scales.ang_vel * self.obs_scales.ang_vel   # ang vel
         noise_vec[62: 65] = noise_scales.quat * self.obs_scales.quat         # euler x,y
+        # print(f"noise_vec:{noise_vec.shape}")
         return noise_vec
 
 
@@ -242,7 +245,7 @@ class XBotLFreeEnv(LeggedRobot):
 
         sin_pos = torch.sin(2 * torch.pi * phase).unsqueeze(1)
         cos_pos = torch.cos(2 * torch.pi * phase).unsqueeze(1)
-        print(f"self.root_states:{self.root_states[:,3:7]}")
+        # print(f"self.root_states:{self.root_states[:,3:7]}")
 
         stance_mask = self._get_gait_phase()
         contact_mask = self.contact_forces[:, self.feet_indices, 2] > 5.
@@ -288,6 +291,9 @@ class XBotLFreeEnv(LeggedRobot):
             self.privileged_obs_buf = torch.cat((self.obs_buf, heights), dim=-1)#97+65+1=163
         
         if self.add_noise:  
+            # print(f"self.noise_scale_vec:{self.noise_scale_vec}")
+            # print(f"self.noise_scale_vec.shape:{self.noise_scale_vec.shape}")
+
             obs_now = obs_buf.clone() + torch.randn_like(obs_buf) * self.noise_scale_vec * self.cfg.noise.noise_level
         else:
             obs_now = obs_buf.clone()
@@ -721,6 +727,28 @@ class XBotLFreeEnv(LeggedRobot):
         return term_1 + term_2 + term_3
     
 class XBotLNoArmsEnv(XBotLFreeEnv):
+    def _get_noise_scale_vec(self, cfg):
+        """ Sets a vector used to scale the noise added to the observations.
+            [NOTE]: Must be adapted when changing the observations structure
+
+        Args:
+            cfg (Dict): Environment config file
+
+        Returns:
+            [torch.Tensor]: Vector of scales used to multiply a uniform distribution in [-1, 1]
+        """
+        noise_vec = torch.zeros(
+            self.cfg.env.num_single_obs, device=self.device)
+        self.add_noise = self.cfg.noise.add_noise
+        noise_scales = self.cfg.noise.noise_scales
+        noise_vec[0: 5] = 0.  # commands
+        noise_vec[5: 17] = noise_scales.dof_pos * self.obs_scales.dof_pos
+        noise_vec[17: 29] = noise_scales.dof_vel * self.obs_scales.dof_vel
+        noise_vec[29: 41] = 0.  # previous actions
+        noise_vec[41: 44] = noise_scales.ang_vel * self.obs_scales.ang_vel   # ang vel
+        noise_vec[44: 47] = noise_scales.quat * self.obs_scales.quat         # euler x,y
+        return noise_vec
+    
     def compute_ref_state(self):
         phase = self._get_phase()
         # print(f"torch.norm(self.commands[:, :2]):{torch.norm(self.commands[:, :2])}")
