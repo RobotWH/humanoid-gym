@@ -193,8 +193,6 @@ def rl_result_callback(msg):
     
     rl_q = msg.data[18:30]
     rl_q = np.array(rl_q, dtype=np.float64)
-    # print(f"rl_q:{rl_q*4}")
-
     rl_v = msg.data[48:60] 
     rl_v = np.array(rl_v, dtype=np.float64)
     rl_kp = msg.data[78:90] 
@@ -228,6 +226,26 @@ def quaternion_to_euler_array(quat):
     # Returns roll, pitch, yaw in a NumPy array in radians
     return np.array([roll_x, pitch_y, yaw_z])
 
+def euler_to_quaternion_array(euler_angles):
+    # 输入参数为欧拉角数组，单位弧度，顺序为 [roll_x, pitch_y, yaw_z]
+    roll, pitch, yaw = euler_angles[0], euler_angles[1], euler_angles[2]
+    
+    # 计算各轴旋转的半角三角函数值
+    cr = np.cos(roll * 0.5)
+    sr = np.sin(roll * 0.5)
+    cp = np.cos(pitch * 0.5)
+    sp = np.sin(pitch * 0.5)
+    cy = np.cos(yaw * 0.5)
+    sy = np.sin(yaw * 0.5)
+    
+    # 四元数分量计算（按ZYX旋转顺序组合）
+    w = cr * cp * cy + sr * sp * sy  # 实部
+    x = sr * cp * cy - cr * sp * sy  # X虚部
+    y = cr * sp * cy + sr * cp * sy  # Y虚部
+    z = cr * cp * sy - sr * sp * cy  # Z虚部
+    
+    return np.array([x, y, z, w])
+
 def get_obs(data):
     '''Extracts an observation from the mujoco data structure
     '''
@@ -249,14 +267,29 @@ def get_obs(data):
 def xbot_state_pub(cfg,cmd_pub,q,dq,quat,omega,tq,acc):
     msg = Float64MultiArray()
     msg.data = [0] * (36 * 3 + 4 + 3 * 2)
-    # print("data大小:", len(msg.data))
     msg.data[24:36] = q[-cfg.env.num_actions:]
     msg.data[60:72] = dq[-cfg.env.num_actions:]
     msg.data[96:108] = tq[-cfg.env.num_actions:]
-    msg.data[108:112] = quat
-    msg.data[112:115] = omega
+    euang = quaternion_to_euler_array(quat)
+    # print(f"euang:{euang}")
+    euang[1:3] = -euang[1:3]
+    quat_tmp = euler_to_quaternion_array(euang)
+    # print(f"quat_tmp:{quat_tmp}")
+    quat_t=np.zeros((4), dtype=np.double)
+    quat_t[0] = quat_tmp[3]
+    quat_t[1] = quat_tmp[0]
+    quat_t[2] = quat_tmp[1]
+    quat_t[3] = quat_tmp[2]
+    # print(f"quat_t:{quat_t}")
+    msg.data[108:112] = quat_t
+    euang_t = quaternion_to_euler_array(quat_t)
+    # print(f"euang_t:{euang_t}")
+
+    omega_copy = np.copy(omega)
+    omega_copy[1:3] = -omega_copy[1:3]
+    msg.data[112:115] = omega_copy
     msg.data[115:118] = acc
-    # print(f"omega:{omega},acc:{acc}")
+    # print(f"omega:{omega}")
     cmd_pub.publish(msg)
 
 def pd_control(target_q, q, kp, target_dq, dq, kd):
@@ -323,6 +356,7 @@ def run_mujoco(policy, cfg):
         mujoco.mj_step(model, data)
         viewer = mujoco_viewer.MujocoViewer(model, data)
         target_q = np.zeros((cfg.env.num_actions), dtype=np.double)
+        target_q_myrl = np.zeros((cfg.env.num_actions), dtype=np.double)
         action = np.zeros((cfg.env.num_actions), dtype=np.double)
         hist_obs = deque()
         for _ in range(cfg.env.frame_stack):
@@ -350,10 +384,11 @@ def run_mujoco(policy, cfg):
                     print(f"hallo:{hallo},shake_hand:{shake_hand},play_bag:{play_bag},my_rl:{my_rl}")
                     obs = np.zeros([1, cfg.env.num_single_obs], dtype=np.float32)
                     eu_ang = quaternion_to_euler_array(quat)
+                    # quat_a = euler_to_quaternion_array(eu_ang)
+                    # print(f"quat_diff:{quat-quat_a}")
                     eu_ang[eu_ang > math.pi] -= 2 * math.pi
                     if math.sqrt(vel_x*vel_x+vel_y*vel_y+ang_vel_yaw*ang_vel_yaw)<cfg.commands.stand_com_threshold:
                         move_lowlevel = 0
-
                     obs[0, 0] = math.sin(2 * math.pi * move_lowlevel * cfg.sim_config.dt  / 0.64)
                     obs[0, 1] = math.cos(2 * math.pi * move_lowlevel * cfg.sim_config.dt  / 0.64)
                     obs[0, 2] = vel_x * cfg.normalization.obs_scales.lin_vel
@@ -364,7 +399,7 @@ def run_mujoco(policy, cfg):
                     obs[0, 29:41] = action
                     obs[0, 41:44] = omega
                     obs[0, 44:47] = eu_ang
-
+                    # print(f"obs:{eu_ang}")
                     obs = np.clip(obs, -cfg.normalization.clip_observations, cfg.normalization.clip_observations)
 
                     hist_obs.append(obs)
@@ -377,7 +412,7 @@ def run_mujoco(policy, cfg):
                     action = np.clip(action, -cfg.normalization.clip_actions, cfg.normalization.clip_actions)
 
                     target_q = action * cfg.control.action_scale
-                        
+
                     left_arm_joints = np.array([-0.2, 0.0, 0.0, 0.15, 0.0, 0.20, 0.0])
                     right_arm_joints = np.array([0.2, 0.0, 0.0, -0.15, 0.0, -0.20, 0.0])
                     hallo_joints = np.array([2.6, 0.0, 0.0, 0.0, -1.60, 0.0, 0.0])
@@ -437,10 +472,11 @@ def run_mujoco(policy, cfg):
                     target_q = np.concatenate([right_arm_joints, target_q])  # 默认沿axis=0拼接
                     target_q = np.concatenate([left_arm_joints, target_q])  # 默认沿axis=0拼接
                     # print(f"target_q:{target_q}")
+                else:
                     left_arm_joints = np.zeros((7), dtype=np.double)
                     right_arm_joints = np.zeros((7), dtype=np.double)
                     target_q_myrl = rl_q
-                    # print(f"rl_q:{rl_q},my_rl:{my_rl}")
+                    print(f"rl_q:{rl_q},my_rl:{my_rl}")
                     target_q_myrl = np.concatenate([right_arm_joints, target_q_myrl])  # 默认沿axis=0拼接
                     target_q_myrl = np.concatenate([left_arm_joints, target_q_myrl])  # 默认沿axis=0拼接
                     # print(f"target_q:{target_q[-12:]}")
@@ -451,24 +487,19 @@ def run_mujoco(policy, cfg):
 
             
             target_dq = np.zeros((all_joints), dtype=np.double)
+            # tau = np.zeros((all_joints), dtype=np.double)
             # Generate PD control
-            # if not my_rl:
-            tau = pd_control(target_q[-all_joints:], q[-all_joints:], cfg.robot_config.kps[-all_joints:],
-                            target_dq[-all_joints:], dq[-all_joints:], cfg.robot_config.kds[-all_joints:])  # Calc torques
-            print(f"tau:{tau}")
-            # else:
-            arm_tor = np.zeros((cfg.sim_config.num_arms_joints), dtype=np.double)
-            rl_all_tor = np.concatenate([arm_tor, rl_tor])
-            # print(f"rl_all_tor:{rl_all_tor}")
-            tau_myrl = pd_control_tor(target_q_myrl[-all_joints:], q[-all_joints:], cfg.robot_config.myrl_kps[-all_joints:],
-                            target_dq[-all_joints:], dq[-all_joints:], cfg.robot_config.myrl_kds[-all_joints:],rl_all_tor)
-            print(f"tau_myrl:{tau_myrl}")
-            print(f"tau_diff:{tau_myrl-tau}")
-            
-
-            
-                
-
+            if not my_rl:
+                tau = pd_control(target_q[-all_joints:], q[-all_joints:], cfg.robot_config.kps[-all_joints:],
+                                target_dq[-all_joints:], dq[-all_joints:], cfg.robot_config.kds[-all_joints:])  # Calc torques
+            else:
+                # arm_tor = np.zeros((cfg.sim_config.num_arms_joints), dtype=np.double)
+                # rl_all_tor = np.concatenate([arm_tor, rl_tor])
+                # print(f"rl_all_tor:{rl_all_tor}")
+                tau = pd_control(target_q_myrl[-all_joints:], q[-all_joints:], cfg.robot_config.kps[-all_joints:],
+                                target_dq[-all_joints:], dq[-all_joints:], cfg.robot_config.kds[-all_joints:])
+                # print(f"tau_myrl:{tau_myrl}")
+        
             tau_limit = 200. * np.ones(all_joints, dtype=np.double)
             tau = np.clip(tau, -tau_limit, tau_limit)  # Clamp torques
             # print(f"tau:{tau}")
