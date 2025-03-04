@@ -190,8 +190,11 @@ def my_rl_state_callback(msg):
 
 def rl_result_callback(msg):
     global my_rl,rl_q,rl_v,rl_kp,rl_kd,rl_tor
+    
     rl_q = msg.data[18:30]
     rl_q = np.array(rl_q, dtype=np.float64)
+    # print(f"rl_q:{rl_q*4}")
+
     rl_v = msg.data[48:60] 
     rl_v = np.array(rl_v, dtype=np.float64)
     rl_kp = msg.data[78:90] 
@@ -200,7 +203,8 @@ def rl_result_callback(msg):
     rl_kd = np.array(rl_kd, dtype=np.float64)
     rl_tor = msg.data[138:150] 
     rl_tor = np.array(rl_tor, dtype=np.float64)
-    my_rl= True
+    # print(f"rl_tor:{rl_tor}")
+    # my_rl= True
 
 def quaternion_to_euler_array(quat):
     # Ensure quaternion is in the correct format [x, y, z, w]
@@ -229,7 +233,7 @@ def get_obs(data):
     '''
     q = data.qpos.astype(np.double)
     # print(f"q.shape:{q.shape}")
-    # np.set_printoptions(suppress=True, precision=3)
+    np.set_printoptions(suppress=True, precision=3)
     # print(f"right_arm_current_q:{q[-19:-12]}")
     # print(f"left_arm_current_q:{q[-26:-19]}")
     dq = data.qvel.astype(np.double)
@@ -262,6 +266,14 @@ def pd_control(target_q, q, kp, target_dq, dq, kd):
     # print(f"target_dq.shape:{target_dq.shape},dq:{dq.shape}")
 
     return (target_q - q) * kp + (target_dq - dq) * kd
+
+def pd_control_tor(target_q, q, kp, target_dq, dq, kd,t):
+    '''Calculates torques from position commands
+    '''
+    # print(f"target_q.shape:{target_q.shape},q:{q.shape}")
+    # print(f"target_dq.shape:{target_dq.shape},dq:{dq.shape}")
+
+    return (target_q - q) * kp + (target_dq - dq) * kd +t
 
 def get_joint_names(model_path):
     model = mujoco.MjModel.from_xml_path(model_path)
@@ -425,17 +437,38 @@ def run_mujoco(policy, cfg):
                     target_q = np.concatenate([right_arm_joints, target_q])  # 默认沿axis=0拼接
                     target_q = np.concatenate([left_arm_joints, target_q])  # 默认沿axis=0拼接
                     # print(f"target_q:{target_q}")
-                else:
                     left_arm_joints = np.zeros((7), dtype=np.double)
                     right_arm_joints = np.zeros((7), dtype=np.double)
-                    target_q = rl_q * cfg.control.action_scale
-                    target_q = np.concatenate([right_arm_joints, target_q])  # 默认沿axis=0拼接
-                    target_q = np.concatenate([left_arm_joints, target_q])  # 默认沿axis=0拼接
+                    target_q_myrl = rl_q
+                    # print(f"rl_q:{rl_q},my_rl:{my_rl}")
+                    target_q_myrl = np.concatenate([right_arm_joints, target_q_myrl])  # 默认沿axis=0拼接
+                    target_q_myrl = np.concatenate([left_arm_joints, target_q_myrl])  # 默认沿axis=0拼接
+                    # print(f"target_q:{target_q[-12:]}")
+                    # print(f"target_q_myrl:{target_q_myrl[-12:]}")
+                    # print(f"target_diff:{target_q[-12:]-target_q_myrl[-12:]}")
+
+
+
             
             target_dq = np.zeros((all_joints), dtype=np.double)
             # Generate PD control
+            # if not my_rl:
             tau = pd_control(target_q[-all_joints:], q[-all_joints:], cfg.robot_config.kps[-all_joints:],
                             target_dq[-all_joints:], dq[-all_joints:], cfg.robot_config.kds[-all_joints:])  # Calc torques
+            print(f"tau:{tau}")
+            # else:
+            arm_tor = np.zeros((cfg.sim_config.num_arms_joints), dtype=np.double)
+            rl_all_tor = np.concatenate([arm_tor, rl_tor])
+            # print(f"rl_all_tor:{rl_all_tor}")
+            tau_myrl = pd_control_tor(target_q_myrl[-all_joints:], q[-all_joints:], cfg.robot_config.myrl_kps[-all_joints:],
+                            target_dq[-all_joints:], dq[-all_joints:], cfg.robot_config.myrl_kds[-all_joints:],rl_all_tor)
+            print(f"tau_myrl:{tau_myrl}")
+            print(f"tau_diff:{tau_myrl-tau}")
+            
+
+            
+                
+
             tau_limit = 200. * np.ones(all_joints, dtype=np.double)
             tau = np.clip(tau, -tau_limit, tau_limit)  # Clamp torques
             # print(f"tau:{tau}")
@@ -480,22 +513,34 @@ if __name__ == '__main__':
 
         if args.arms:
             class robot_config:
-                # kps = np.array([50,15,50,40,25,15,15,200, 200, 350, 350, 15, 15, 200, 200, 350, 350, 15, 15], dtype=np.double)
+      
                 kps = np.array([200, 200, 200, 200, 200, 200, 200,
                                 200, 200, 200, 200, 200, 200, 200,
                                 200, 200, 350, 350, 15,  15, 
                                 200, 200, 350, 350, 15,  15       ], dtype=np.double)
+                myrl_kps = np.array([200, 200, 200, 200, 200, 200, 200,
+                                200, 200, 200, 200, 200, 200, 200,
+                                200, 200, 350, 350, 0,  0, 
+                                200, 200, 350, 350, 0,  0       ], dtype=np.double)
 
                 kds = np.array([10,10,25,10,15, 5 ,10,
                                 10,10,25,10,15, 5 ,10, 
                                 10,10,10,10,10, 10, 
                                 10,10,10,10,10, 10    ], dtype=np.double)
+                myrl_kds = np.array([10,10,25,10,15, 5 ,10,
+                                10,10,25,10,15, 5 ,10, 
+                                10,10,10,10,2, 2, 
+                                10,10,10,10,2, 2    ], dtype=np.double)
         else:
             class robot_config:
                 kps = np.array([200, 200, 350, 350, 15, 15, 
                                 200, 200, 350, 350, 15, 15], dtype=np.double)
+                myrl_kps = np.array([   200, 200, 350, 350, 0, 0, 
+                                        200, 200, 350, 350, 0, 0], dtype=np.double)
                 kds = np.array([10, 10, 10, 10, 10, 10, 
                                 10, 10, 10, 10, 10,10], dtype=np.double)
+                myrl_kds = np.array([10, 10, 10, 10, 2, 2, 
+                                10, 10, 10, 10, 2, 2], dtype=np.double)
 
     policy = torch.jit.load(args.load_model)
     run_mujoco(policy, Sim2simCfg())
