@@ -428,9 +428,7 @@ def run_mujoco(policy, cfg):
                 else:
                     left_arm_joints = np.zeros((7), dtype=np.double)
                     right_arm_joints = np.zeros((7), dtype=np.double)
-                    rl_q = np.zeros((12), dtype=np.double)
                     target_q = rl_q * cfg.control.action_scale
-                    print(f"rl_q:{rl_q}")
                     target_q = np.concatenate([right_arm_joints, target_q])  # 默认沿axis=0拼接
                     target_q = np.concatenate([left_arm_joints, target_q])  # 默认沿axis=0拼接
             
