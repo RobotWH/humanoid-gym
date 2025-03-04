@@ -120,9 +120,6 @@ class KeyboardThread(threading.Thread):
         self.listener.stop()
         self.join()
 
-
-
-
 joints_name = [
         "neck_yaw_joint",
         "neck_pitch_joint",
@@ -158,8 +155,15 @@ joints_name = [
 
 joints_dict = dict.fromkeys(joints_name, 0)
 
-
 play_bag = False
+
+rl_q = 0
+rl_v = 0
+rl_kp = 0
+rl_kd = 0 
+rl_tor = 0
+
+my_rl= False
 
 def signal_handler(sig, frame):
     rospy.signal_shutdown("User requested shutdown")
@@ -178,6 +182,25 @@ def bag_state_callback(msg):
     global play_bag
     play_bag = msg.data
     # print(f"play_bag:{play_bag}")
+
+def my_rl_state_callback(msg):
+    global my_rl
+    my_rl = msg.data
+    # print(f"play_bag:{play_bag}")
+
+def rl_result_callback(msg):
+    global my_rl,rl_q,rl_v,rl_kp,rl_kd,rl_tor
+    rl_q = msg.data[18:30]
+    rl_q = np.array(rl_q, dtype=np.float64)
+    rl_v = msg.data[48:60] 
+    rl_v = np.array(rl_v, dtype=np.float64)
+    rl_kp = msg.data[78:90] 
+    rl_kp = np.array(rl_kp, dtype=np.float64)
+    rl_kd = msg.data[108:120] 
+    rl_kd = np.array(rl_kd, dtype=np.float64)
+    rl_tor = msg.data[138:150] 
+    rl_tor = np.array(rl_tor, dtype=np.float64)
+    my_rl= True
 
 def quaternion_to_euler_array(quat):
     # Ensure quaternion is in the correct format [x, y, z, w]
@@ -222,7 +245,7 @@ def get_obs(data):
 def xbot_state_pub(cfg,cmd_pub,q,dq,quat,omega,tq,acc):
     msg = Float64MultiArray()
     msg.data = [0] * (36 * 3 + 4 + 3 * 2)
-    print("data大小:", len(msg.data))
+    # print("data大小:", len(msg.data))
     msg.data[24:36] = q[-cfg.env.num_actions:]
     msg.data[60:72] = dq[-cfg.env.num_actions:]
     msg.data[96:108] = tq[-cfg.env.num_actions:]
@@ -231,8 +254,6 @@ def xbot_state_pub(cfg,cmd_pub,q,dq,quat,omega,tq,acc):
     msg.data[115:118] = acc
     # print(f"omega:{omega},acc:{acc}")
     cmd_pub.publish(msg)
-
-
 
 def pd_control(target_q, q, kp, target_dq, dq, kd):
     '''Calculates torques from position commands
@@ -267,12 +288,14 @@ def run_mujoco(policy, cfg):
     Returns:
         None
     """
-    global play_bag
+    global my_rl,rl_q,rl_v,rl_kp,rl_kd,rl_tor,play_bag
     signal.signal(signal.SIGINT, signal_handler)
     rospy.init_node('xbot_mujoco_simulator', anonymous=True)
     while not rospy.is_shutdown():
         rospy.Subscriber("/xbot_joints", JointState, joint_state_callback, queue_size=1)
+        rospy.Subscriber("/policy_input", Float64MultiArray, rl_result_callback, queue_size=1)
         rospy.Subscriber("/bag_state", Bool, bag_state_callback)
+        rospy.Subscriber("/my_rl_state", Bool, my_rl_state_callback)
         cmd_pub = rospy.Publisher('/controllers/xbot_controller/policy_output', Float64MultiArray, queue_size=1)
 
         all_joints = cfg.env.num_actions+cfg.sim_config.num_arms_joints
@@ -308,106 +331,113 @@ def run_mujoco(policy, cfg):
             
             # 1000hz -> 100hz
             if count_lowlevel % cfg.sim_config.decimation == 0:
-                vel_x,vel_y,ang_vel_yaw = keyboard_thread.get_velocity()
-                hallo,shake_hand = keyboard_thread.get_arms_cmd()
-                print(f"vel_x:{vel_x}, vel_y:{vel_y},ang_vel_yaw:{ang_vel_yaw},hallo:{hallo},shake_hand:{shake_hand},play_bag:{play_bag}")
+                if not my_rl:
+                    vel_x,vel_y,ang_vel_yaw = keyboard_thread.get_velocity()
+                    hallo,shake_hand = keyboard_thread.get_arms_cmd()
+                    print(f"vel_x:{vel_x}, vel_y:{vel_y},ang_vel_yaw:{ang_vel_yaw}")
+                    print(f"hallo:{hallo},shake_hand:{shake_hand},play_bag:{play_bag},my_rl:{my_rl}")
+                    obs = np.zeros([1, cfg.env.num_single_obs], dtype=np.float32)
+                    eu_ang = quaternion_to_euler_array(quat)
+                    eu_ang[eu_ang > math.pi] -= 2 * math.pi
+                    if math.sqrt(vel_x*vel_x+vel_y*vel_y+ang_vel_yaw*ang_vel_yaw)<cfg.commands.stand_com_threshold:
+                        move_lowlevel = 0
 
-                obs = np.zeros([1, cfg.env.num_single_obs], dtype=np.float32)
-                eu_ang = quaternion_to_euler_array(quat)
-                eu_ang[eu_ang > math.pi] -= 2 * math.pi
-                if math.sqrt(vel_x*vel_x+vel_y*vel_y+ang_vel_yaw*ang_vel_yaw)<cfg.commands.stand_com_threshold:
-                    move_lowlevel = 0
+                    obs[0, 0] = math.sin(2 * math.pi * move_lowlevel * cfg.sim_config.dt  / 0.64)
+                    obs[0, 1] = math.cos(2 * math.pi * move_lowlevel * cfg.sim_config.dt  / 0.64)
+                    obs[0, 2] = vel_x * cfg.normalization.obs_scales.lin_vel
+                    obs[0, 3] = vel_y * cfg.normalization.obs_scales.lin_vel
+                    obs[0, 4] = ang_vel_yaw * cfg.normalization.obs_scales.ang_vel
+                    obs[0, 5:17] = q_leg * cfg.normalization.obs_scales.dof_pos
+                    obs[0, 17:29] = dq_leg * cfg.normalization.obs_scales.dof_vel
+                    obs[0, 29:41] = action
+                    obs[0, 41:44] = omega
+                    obs[0, 44:47] = eu_ang
 
-                obs[0, 0] = math.sin(2 * math.pi * move_lowlevel * cfg.sim_config.dt  / 0.64)
-                obs[0, 1] = math.cos(2 * math.pi * move_lowlevel * cfg.sim_config.dt  / 0.64)
-                obs[0, 2] = vel_x * cfg.normalization.obs_scales.lin_vel
-                obs[0, 3] = vel_y * cfg.normalization.obs_scales.lin_vel
-                obs[0, 4] = ang_vel_yaw * cfg.normalization.obs_scales.ang_vel
-                obs[0, 5:17] = q_leg * cfg.normalization.obs_scales.dof_pos
-                obs[0, 17:29] = dq_leg * cfg.normalization.obs_scales.dof_vel
-                obs[0, 29:41] = action
-                obs[0, 41:44] = omega
-                obs[0, 44:47] = eu_ang
+                    obs = np.clip(obs, -cfg.normalization.clip_observations, cfg.normalization.clip_observations)
 
-                obs = np.clip(obs, -cfg.normalization.clip_observations, cfg.normalization.clip_observations)
+                    hist_obs.append(obs)
+                    hist_obs.popleft()
 
-                hist_obs.append(obs)
-                hist_obs.popleft()
+                    policy_input = np.zeros([1, cfg.env.num_observations], dtype=np.float32)
+                    for i in range(cfg.env.frame_stack):
+                        policy_input[0, i * cfg.env.num_single_obs : (i + 1) * cfg.env.num_single_obs] = hist_obs[i][0, :]
+                    action[:] = policy(torch.tensor(policy_input))[0].detach().numpy()
+                    action = np.clip(action, -cfg.normalization.clip_actions, cfg.normalization.clip_actions)
 
-                policy_input = np.zeros([1, cfg.env.num_observations], dtype=np.float32)
-                for i in range(cfg.env.frame_stack):
-                    policy_input[0, i * cfg.env.num_single_obs : (i + 1) * cfg.env.num_single_obs] = hist_obs[i][0, :]
-                action[:] = policy(torch.tensor(policy_input))[0].detach().numpy()
-                action = np.clip(action, -cfg.normalization.clip_actions, cfg.normalization.clip_actions)
-
-                target_q = action * cfg.control.action_scale
+                    target_q = action * cfg.control.action_scale
+                        
+                    left_arm_joints = np.array([-0.2, 0.0, 0.0, 0.15, 0.0, 0.20, 0.0])
+                    right_arm_joints = np.array([0.2, 0.0, 0.0, -0.15, 0.0, -0.20, 0.0])
+                    hallo_joints = np.array([2.6, 0.0, 0.0, 0.0, -1.60, 0.0, 0.0])
+                    shake_hand_joints = np.array([0.5, 0.0, 0.0, -0.5, -0.00, -0.6, 0.0])
+                    bag_left_arm = np.array([   joints_dict['left_shoulder_pitch_joint'],
+                                                joints_dict['left_shoulder_roll_joint'],
+                                                joints_dict['left_arm_yaw_joint'],
+                                                joints_dict['left_elbow_pitch_joint'],
+                                                joints_dict['left_elbow_yaw_joint'],
+                                                joints_dict['left_wrist_roll_joint'],
+                                                joints_dict['left_wrist_yaw_joint']])
+                    bag_right_arm = np.array([  joints_dict['right_shoulder_pitch_joint'],
+                                                joints_dict['right_shoulder_roll_joint'],
+                                                joints_dict['right_arm_yaw_joint'],
+                                                joints_dict['right_elbow_pitch_joint'],
+                                                joints_dict['right_elbow_yaw_joint'],
+                                                joints_dict['right_wrist_roll_joint'],
+                                                joints_dict['right_wrist_yaw_joint']])
+                    # print(f"bag_left_arm:{bag_left_arm}")
+                    # print(f"play_bag:{play_bag}")
                     
-                left_arm_joints = np.array([-0.2, 0.0, 0.0, 0.15, 0.0, 0.20, 0.0])
-                right_arm_joints = np.array([0.2, 0.0, 0.0, -0.15, 0.0, -0.20, 0.0])
-                hallo_joints = np.array([2.6, 0.0, 0.0, 0.0, -1.60, 0.0, 0.0])
-                shake_hand_joints = np.array([0.5, 0.0, 0.0, -0.5, -0.00, -0.6, 0.0])
-                bag_left_arm = np.array([   joints_dict['left_shoulder_pitch_joint'],
-                                            joints_dict['left_shoulder_roll_joint'],
-                                            joints_dict['left_arm_yaw_joint'],
-                                            joints_dict['left_elbow_pitch_joint'],
-                                            joints_dict['left_elbow_yaw_joint'],
-                                            joints_dict['left_wrist_roll_joint'],
-                                            joints_dict['left_wrist_yaw_joint']])
-                bag_right_arm = np.array([  joints_dict['right_shoulder_pitch_joint'],
-                                            joints_dict['right_shoulder_roll_joint'],
-                                            joints_dict['right_arm_yaw_joint'],
-                                            joints_dict['right_elbow_pitch_joint'],
-                                            joints_dict['right_elbow_yaw_joint'],
-                                            joints_dict['right_wrist_roll_joint'],
-                                            joints_dict['right_wrist_yaw_joint']])
-                # print(f"bag_left_arm:{bag_left_arm}")
-                # print(f"play_bag:{play_bag}")
-                
-                if math.sqrt(vel_x*vel_x+vel_y*vel_y+ang_vel_yaw*ang_vel_yaw)>cfg.commands.stand_com_threshold:
-                    if obs[0,0] >= 0 :
-                        left_arm_joints = np.fabs(obs[0, 0]) * left_arm_joints
-                        right_arm_joints = right_arm_joints *0
-                    else:
-                        right_arm_joints = np.fabs(obs[0, 0]) * right_arm_joints
-                        left_arm_joints = left_arm_joints * 0
-                elif not play_bag :
-                    if hallo :
-                        if hallo_time < all_time:
-                            hallo_time += 1
-                        left_arm_joints  = left_arm_joints * 0 
-                        right_arm_joints = hallo_joints * (hallo_time/all_time)
-                    elif shake_hand:
-                        if shake_hand_time < all_time:
-                            shake_hand_time += 1
-                        left_arm_joints  = left_arm_joints * 0 
-                        right_arm_joints = shake_hand_joints * (shake_hand_time/all_time) 
-                    else:
-                        if hallo_time>0:
-                            hallo_time -= 0.5
-                            left_arm_joints  = left_arm_joints * 0 
-                            right_arm_joints =  hallo_joints * (hallo_time/all_time)
-                        elif shake_hand_time>0:
-                            shake_hand_time -= 0.5
-                            left_arm_joints  = left_arm_joints * 0 
-                            right_arm_joints =  shake_hand_joints * (shake_hand_time/all_time) 
+                    if math.sqrt(vel_x*vel_x+vel_y*vel_y+ang_vel_yaw*ang_vel_yaw)>cfg.commands.stand_com_threshold:
+                        if obs[0,0] >= 0 :
+                            left_arm_joints = np.fabs(obs[0, 0]) * left_arm_joints
+                            right_arm_joints = right_arm_joints *0
                         else:
+                            right_arm_joints = np.fabs(obs[0, 0]) * right_arm_joints
+                            left_arm_joints = left_arm_joints * 0
+                    elif not play_bag :
+                        if hallo :
+                            if hallo_time < all_time:
+                                hallo_time += 1
                             left_arm_joints  = left_arm_joints * 0 
-                            right_arm_joints = right_arm_joints * 0 
-                elif play_bag:
-                    left_arm_joints = bag_left_arm
-                    right_arm_joints = bag_right_arm
-                # print(f"hallo_time:{hallo_time},shake_hand_time:{shake_hand_time}")
-                
-
-                # print(f"left_arm_joints:{left_arm_joints}")
-                target_q = np.concatenate([right_arm_joints, target_q])  # 默认沿axis=0拼接
-                target_q = np.concatenate([left_arm_joints, target_q])  # 默认沿axis=0拼接
-                # print(f"target_q:{target_q}")
-
+                            right_arm_joints = hallo_joints * (hallo_time/all_time)
+                        elif shake_hand:
+                            if shake_hand_time < all_time:
+                                shake_hand_time += 1
+                            left_arm_joints  = left_arm_joints * 0 
+                            right_arm_joints = shake_hand_joints * (shake_hand_time/all_time) 
+                        else:
+                            if hallo_time>0:
+                                hallo_time -= 0.5
+                                left_arm_joints  = left_arm_joints * 0 
+                                right_arm_joints =  hallo_joints * (hallo_time/all_time)
+                            elif shake_hand_time>0:
+                                shake_hand_time -= 0.5
+                                left_arm_joints  = left_arm_joints * 0 
+                                right_arm_joints =  shake_hand_joints * (shake_hand_time/all_time) 
+                            else:
+                                left_arm_joints  = left_arm_joints * 0 
+                                right_arm_joints = right_arm_joints * 0 
+                    elif play_bag:
+                        left_arm_joints = bag_left_arm
+                        right_arm_joints = bag_right_arm
+                    # print(f"hallo_time:{hallo_time},shake_hand_time:{shake_hand_time}")
+                    # print(f"left_arm_joints:{left_arm_joints}")
+                    target_q = np.concatenate([right_arm_joints, target_q])  # 默认沿axis=0拼接
+                    target_q = np.concatenate([left_arm_joints, target_q])  # 默认沿axis=0拼接
+                    # print(f"target_q:{target_q}")
+                else:
+                    left_arm_joints = np.zeros((7), dtype=np.double)
+                    right_arm_joints = np.zeros((7), dtype=np.double)
+                    rl_q = np.zeros((12), dtype=np.double)
+                    target_q = rl_q * cfg.control.action_scale
+                    print(f"rl_q:{rl_q}")
+                    target_q = np.concatenate([right_arm_joints, target_q])  # 默认沿axis=0拼接
+                    target_q = np.concatenate([left_arm_joints, target_q])  # 默认沿axis=0拼接
+            
             target_dq = np.zeros((all_joints), dtype=np.double)
             # Generate PD control
-            tau = pd_control(target_q[-all_joints:], q[-all_joints:], cfg.robot_config.kps,
-                            target_dq[-all_joints:], dq[-all_joints:], cfg.robot_config.kds)  # Calc torques
+            tau = pd_control(target_q[-all_joints:], q[-all_joints:], cfg.robot_config.kps[-all_joints:],
+                            target_dq[-all_joints:], dq[-all_joints:], cfg.robot_config.kds[-all_joints:])  # Calc torques
             tau_limit = 200. * np.ones(all_joints, dtype=np.double)
             tau = np.clip(tau, -tau_limit, tau_limit)  # Clamp torques
             # print(f"tau:{tau}")
