@@ -45,6 +45,9 @@ from std_msgs.msg import Bool
 from std_msgs.msg import Float64MultiArray
 import signal
 import sys
+import time
+from threading import Event
+
 
 class KeyboardThread(threading.Thread):
     def __init__(self):
@@ -165,6 +168,8 @@ rl_tor = 0
 
 my_rl= False
 
+callback_event = Event()  # 添加全局事件
+
 def signal_handler(sig, frame):
     rospy.signal_shutdown("User requested shutdown")
     sys.exit(0)  
@@ -189,10 +194,10 @@ def my_rl_state_callback(msg):
     # print(f"play_bag:{play_bag}")
 
 def rl_result_callback(msg):
-    global my_rl,rl_q,rl_v,rl_kp,rl_kd,rl_tor
-    
+    global my_rl,rl_q,rl_v,rl_kp,rl_kd,rl_tor,callback_event
     rl_q = msg.data[18:30]
     rl_q = np.array(rl_q, dtype=np.float64)
+    print(f"-------------rl_Q------:{rl_q}")
     rl_v = msg.data[48:60] 
     rl_v = np.array(rl_v, dtype=np.float64)
     rl_kp = msg.data[78:90] 
@@ -201,8 +206,9 @@ def rl_result_callback(msg):
     rl_kd = np.array(rl_kd, dtype=np.float64)
     rl_tor = msg.data[138:150] 
     rl_tor = np.array(rl_tor, dtype=np.float64)
+    callback_event.set()
     # print(f"rl_tor:{rl_tor}")
-    # my_rl= True
+  
 
 def quaternion_to_euler_array(quat):
     # Ensure quaternion is in the correct format [x, y, z, w]
@@ -283,7 +289,7 @@ def xbot_state_pub(cfg,cmd_pub,q,dq,quat,omega,tq,acc):
     # print(f"quat_t:{quat_t}")
     msg.data[108:112] = quat_t
     euang_t = quaternion_to_euler_array(quat_t)
-    # print(f"euang_t:{euang_t}")
+    print(f"euang_t:{euang_t}")
 
     omega_copy = np.copy(omega)
     omega_copy[1:3] = -omega_copy[1:3]
@@ -336,48 +342,52 @@ def run_mujoco(policy, cfg):
     global my_rl,rl_q,rl_v,rl_kp,rl_kd,rl_tor,play_bag
     signal.signal(signal.SIGINT, signal_handler)
     rospy.init_node('xbot_mujoco_simulator', anonymous=True)
+    
+    rospy.Subscriber("/xbot_joints", JointState, joint_state_callback, queue_size=1)
+    rospy.Subscriber("/policy_input", Float64MultiArray, rl_result_callback, queue_size=1)
+    rospy.Subscriber("/bag_state", Bool, bag_state_callback)
+    rospy.Subscriber("/my_rl_state", Bool, my_rl_state_callback)
+    cmd_pub = rospy.Publisher('/controllers/xbot_controller/policy_output', Float64MultiArray, queue_size=1)
+
+    obs_pub = rospy.Publisher('/obs', Float64MultiArray, queue_size=1)
+
+    all_joints = cfg.env.num_actions+cfg.sim_config.num_arms_joints
+    keyboard_thread = KeyboardThread()
+    keyboard_thread.start()
+    model = mujoco.MjModel.from_xml_path(cfg.sim_config.mujoco_model_path)
+    # for i in range(model.njnt):
+    #     jnt_type = model.jnt_type[i]
+    #     jnt_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, i)
+    #     print(f"关节 {jnt_name} 类型: {jnt_type} (自由度: {model.jnt_dofadr[i]})")
+    model.opt.timestep = cfg.sim_config.dt
+    data = mujoco.MjData(model)
+    mujoco.mj_step(model, data)
+    viewer = mujoco_viewer.MujocoViewer(model, data)
+    target_q = np.zeros((cfg.env.num_actions), dtype=np.double)
+    target_q_myrl = np.zeros((cfg.env.num_actions), dtype=np.double)
+    action = np.zeros((cfg.env.num_actions), dtype=np.double)
+    hist_obs = deque()
+    for _ in range(cfg.env.frame_stack):
+        hist_obs.append(np.zeros([1, cfg.env.num_single_obs], dtype=np.double))
+
+    count_lowlevel = 0
+    move_lowlevel =  0
+    hallo_time = 0 
+    shake_hand_time = 0
+    all_time = 30
+
+        # for _ in tqdm(range(int(cfg.sim_config.sim_duration / cfg.sim_config.dt)), desc="Simulating..."):
     while not rospy.is_shutdown():
-        rospy.Subscriber("/xbot_joints", JointState, joint_state_callback, queue_size=1)
-        rospy.Subscriber("/policy_input", Float64MultiArray, rl_result_callback, queue_size=1)
-        rospy.Subscriber("/bag_state", Bool, bag_state_callback)
-        rospy.Subscriber("/my_rl_state", Bool, my_rl_state_callback)
-        cmd_pub = rospy.Publisher('/controllers/xbot_controller/policy_output', Float64MultiArray, queue_size=1)
-
-        all_joints = cfg.env.num_actions+cfg.sim_config.num_arms_joints
-        keyboard_thread = KeyboardThread()
-        keyboard_thread.start()
-        model = mujoco.MjModel.from_xml_path(cfg.sim_config.mujoco_model_path)
-        # for i in range(model.njnt):
-        #     jnt_type = model.jnt_type[i]
-        #     jnt_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, i)
-        #     print(f"关节 {jnt_name} 类型: {jnt_type} (自由度: {model.jnt_dofadr[i]})")
-        model.opt.timestep = cfg.sim_config.dt
-        data = mujoco.MjData(model)
-        mujoco.mj_step(model, data)
-        viewer = mujoco_viewer.MujocoViewer(model, data)
-        target_q = np.zeros((cfg.env.num_actions), dtype=np.double)
-        target_q_myrl = np.zeros((cfg.env.num_actions), dtype=np.double)
-        action = np.zeros((cfg.env.num_actions), dtype=np.double)
-        hist_obs = deque()
-        for _ in range(cfg.env.frame_stack):
-            hist_obs.append(np.zeros([1, cfg.env.num_single_obs], dtype=np.double))
-
-        count_lowlevel = 0
-        move_lowlevel =  0
-        hallo_time = 0 
-        shake_hand_time = 0
-        all_time = 30
-
-        for _ in tqdm(range(int(cfg.sim_config.sim_duration / cfg.sim_config.dt)), desc="Simulating..."):
             # Obtain an observation
+            start = time.time()
             q, dq, quat, v, omega, gvec,tq,acc = get_obs(data)
             xbot_state_pub(cfg,cmd_pub,q,dq,quat,omega,tq,acc)
             q_leg = q[-cfg.env.num_actions:]
             dq_leg = dq[-cfg.env.num_actions:]
             
             # 1000hz -> 100hz
-            if count_lowlevel % cfg.sim_config.decimation == 0:
-                if not my_rl:
+            if not my_rl:
+                if count_lowlevel % cfg.sim_config.decimation == 0:
                     vel_x,vel_y,ang_vel_yaw = keyboard_thread.get_velocity()
                     hallo,shake_hand = keyboard_thread.get_arms_cmd()
                     print(f"vel_x:{vel_x}, vel_y:{vel_y},ang_vel_yaw:{ang_vel_yaw}")
@@ -397,9 +407,21 @@ def run_mujoco(policy, cfg):
                     obs[0, 5:17] = q_leg * cfg.normalization.obs_scales.dof_pos
                     obs[0, 17:29] = dq_leg * cfg.normalization.obs_scales.dof_vel
                     obs[0, 29:41] = action
+                    # print(f"action0:{obs[0, 29:41]}")
                     obs[0, 41:44] = omega
                     obs[0, 44:47] = eu_ang
-                    # print(f"obs:{eu_ang}")
+                    # obs=np.array([  0,      1,      0,      0,      0,      0.02 ,  0.028 , 0.051, -0.008, -0.029,
+                    #                -0.024,  0.01,  -0.007,  0.058,  0.002, -0.086, -0.014, -0.001, -0,     -0.001,
+                    #                -0.001,  0.005,  0.006, -0.,    -0.001,  0.001, -0.002, -0.012,  0.004, -0.073,
+                    #                 0.069,  0.102 , 0.355,  1.214, -0.131,  0.068, -0.066,  0.238, -0.523,  2.896,
+                    #                 0.095, -0.006,  0.012, -0.01,   0.005, -0.031, -0.012], dtype=np.float32)
+                    # obs = obs.reshape(1, -1)
+                    # obs_copy= np.copy(obs)
+                    obs_copy = np.array(obs, dtype=np.float64).flatten().tolist()  # 转为Python列表并确保float64
+                    msg = Float64MultiArray()
+                    msg.data = obs_copy  # 直接赋值，无需初始化占位符[0]*47
+                    obs_pub.publish(msg)
+                    # print(f"obs:{obs}")
                     obs = np.clip(obs, -cfg.normalization.clip_observations, cfg.normalization.clip_observations)
 
                     hist_obs.append(obs)
@@ -410,7 +432,8 @@ def run_mujoco(policy, cfg):
                         policy_input[0, i * cfg.env.num_single_obs : (i + 1) * cfg.env.num_single_obs] = hist_obs[i][0, :]
                     action[:] = policy(torch.tensor(policy_input))[0].detach().numpy()
                     action = np.clip(action, -cfg.normalization.clip_actions, cfg.normalization.clip_actions)
-
+                    
+                    # print(f"action1:{action}")
                     target_q = action * cfg.control.action_scale
 
                     left_arm_joints = np.array([-0.2, 0.0, 0.0, 0.15, 0.0, 0.20, 0.0])
@@ -472,20 +495,58 @@ def run_mujoco(policy, cfg):
                     target_q = np.concatenate([right_arm_joints, target_q])  # 默认沿axis=0拼接
                     target_q = np.concatenate([left_arm_joints, target_q])  # 默认沿axis=0拼接
                     # print(f"target_q:{target_q}")
-                else:
-                    left_arm_joints = np.zeros((7), dtype=np.double)
-                    right_arm_joints = np.zeros((7), dtype=np.double)
-                    target_q_myrl = rl_q
-                    print(f"rl_q:{rl_q},my_rl:{my_rl}")
-                    target_q_myrl = np.concatenate([right_arm_joints, target_q_myrl])  # 默认沿axis=0拼接
-                    target_q_myrl = np.concatenate([left_arm_joints, target_q_myrl])  # 默认沿axis=0拼接
-                    # print(f"target_q:{target_q[-12:]}")
-                    # print(f"target_q_myrl:{target_q_myrl[-12:]}")
-                    # print(f"target_diff:{target_q[-12:]-target_q_myrl[-12:]}")
+            else:
+                callback_event.wait()  # 阻塞等待事件
+                callback_event.clear()  # 立即清除事件
+                vel_x,vel_y,ang_vel_yaw = keyboard_thread.get_velocity()
+                hallo,shake_hand = keyboard_thread.get_arms_cmd()
+                print(f"vel_x:{vel_x}, vel_y:{vel_y},ang_vel_yaw:{ang_vel_yaw}")
+                print(f"hallo:{hallo},shake_hand:{shake_hand},play_bag:{play_bag},my_rl:{my_rl}")
+                obs = np.zeros([1, cfg.env.num_single_obs], dtype=np.float32)
+                eu_ang = quaternion_to_euler_array(quat)
+                # quat_a = euler_to_quaternion_array(eu_ang)
+                # print(f"quat_diff:{quat-quat_a}")
+                eu_ang[eu_ang > math.pi] -= 2 * math.pi
+                if math.sqrt(vel_x*vel_x+vel_y*vel_y+ang_vel_yaw*ang_vel_yaw)<cfg.commands.stand_com_threshold:
+                    move_lowlevel = 0
+                obs[0, 0] = math.sin(2 * math.pi * move_lowlevel * cfg.sim_config.dt  / 0.64)
+                obs[0, 1] = math.cos(2 * math.pi * move_lowlevel * cfg.sim_config.dt  / 0.64)
+                obs[0, 2] = vel_x * cfg.normalization.obs_scales.lin_vel
+                obs[0, 3] = vel_y * cfg.normalization.obs_scales.lin_vel
+                obs[0, 4] = ang_vel_yaw * cfg.normalization.obs_scales.ang_vel
+                obs[0, 5:17] = q_leg * cfg.normalization.obs_scales.dof_pos
+                obs[0, 17:29] = dq_leg * cfg.normalization.obs_scales.dof_vel
+                obs[0, 29:41] = action
+                # print(f"action0:{obs[0, 29:41]}")
+                obs[0, 41:44] = omega
+                obs[0, 44:47] = eu_ang
+                # obs=np.array([  0,      1,      0,      0,      0,      0.02 ,  0.028 , 0.051, -0.008, -0.029,
+                #                -0.024,  0.01,  -0.007,  0.058,  0.002, -0.086, -0.014, -0.001, -0,     -0.001,
+                #                -0.001,  0.005,  0.006, -0.,    -0.001,  0.001, -0.002, -0.012,  0.004, -0.073,
+                #                 0.069,  0.102 , 0.355,  1.214, -0.131,  0.068, -0.066,  0.238, -0.523,  2.896,
+                #                 0.095, -0.006,  0.012, -0.01,   0.005, -0.031, -0.012], dtype=np.float32)
+                # obs = obs.reshape(1, -1)
+                # obs_copy= np.copy(obs)
+                obs_copy = np.array(obs, dtype=np.float64).flatten().tolist()  # 转为Python列表并确保float64
+                msg = Float64MultiArray()
+                msg.data = obs_copy  # 直接赋值，无需初始化占位符[0]*47
+                obs_pub.publish(msg)
+                # print(f"obs:{obs}")
+                obs = np.clip(obs, -cfg.normalization.clip_observations, cfg.normalization.clip_observations)
 
+                hist_obs.append(obs)
+                hist_obs.popleft()
+                action = rl_q * 4
+                target_q_myrl = action * cfg.control.action_scale
+                left_arm_joints = np.zeros((7), dtype=np.double)
+                right_arm_joints = np.zeros((7), dtype=np.double)
+                print(f"rl_q:{rl_q}")
+                target_q_myrl = np.concatenate([right_arm_joints, target_q_myrl])  # 默认沿axis=0拼接
+                target_q_myrl = np.concatenate([left_arm_joints, target_q_myrl])  # 默认沿axis=0拼接
+                # print(f"target_q:{target_q[-12:]}")
+                # print(f"target_q_myrl:{target_q_myrl[-12:]}")
+                # print(f"target_diff:{target_q[-12:]-target_q_myrl[-12:]}")
 
-
-            
             target_dq = np.zeros((all_joints), dtype=np.double)
             # tau = np.zeros((all_joints), dtype=np.double)
             # Generate PD control
@@ -503,15 +564,21 @@ def run_mujoco(policy, cfg):
             tau_limit = 200. * np.ones(all_joints, dtype=np.double)
             tau = np.clip(tau, -tau_limit, tau_limit)  # Clamp torques
             # print(f"tau:{tau}")
-
             data.ctrl = tau
+            start2 = time.time() 
             mujoco.mj_step(model, data)
             viewer.render()
             count_lowlevel += 1
             move_lowlevel += 1
             
+
+            end = time.time()
+            # print(f"执行耗时：{end - start:.7f}秒")
+
+            # print(f"仿真耗时：{end - start2:.7f}秒")
             # play_bag = False
-            rospy.sleep(0.001)  # 控制ROS处理频率
+            # time.sleep(0.01-(end - start))
+            # rospy.sleep()  # 控制ROS处理频率
 
     viewer.close()
 
