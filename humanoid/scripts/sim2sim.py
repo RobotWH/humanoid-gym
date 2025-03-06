@@ -47,6 +47,7 @@ import signal
 import sys
 import time
 from threading import Event
+from geometry_msgs.msg import Twist
 
 
 class KeyboardThread(threading.Thread):
@@ -165,7 +166,9 @@ rl_v = 0
 rl_kp = 0
 rl_kd = 0 
 rl_tor = 0
-
+vx = 0 
+vy = 0
+ang = 0
 my_rl= False
 
 callback_event = Event()  # 添加全局事件
@@ -208,7 +211,12 @@ def rl_result_callback(msg):
     rl_tor = np.array(rl_tor, dtype=np.float64)
     callback_event.set()
     # print(f"rl_tor:{rl_tor}")
-  
+
+def TwistCmdCallback(data):
+        global  vx,vy,ang   
+        vx = data.linear.x 
+        vy = data.linear.y
+        ang = data.angular.z 
 
 def quaternion_to_euler_array(quat):
     # Ensure quaternion is in the correct format [x, y, z, w]
@@ -289,7 +297,7 @@ def xbot_state_pub(cfg,cmd_pub,q,dq,quat,omega,tq,acc):
     # print(f"quat_t:{quat_t}")
     msg.data[108:112] = quat_t
     euang_t = quaternion_to_euler_array(quat_t)
-    print(f"euang_t:{euang_t}")
+    # print(f"euang_t:{euang_t}")
 
     omega_copy = np.copy(omega)
     omega_copy[1:3] = -omega_copy[1:3]
@@ -339,7 +347,7 @@ def run_mujoco(policy, cfg):
     Returns:
         None
     """
-    global my_rl,rl_q,rl_v,rl_kp,rl_kd,rl_tor,play_bag
+    global my_rl,rl_q,rl_v,rl_kp,rl_kd,rl_tor,play_bag,vx,vy,ang
     signal.signal(signal.SIGINT, signal_handler)
     rospy.init_node('xbot_mujoco_simulator', anonymous=True)
     
@@ -347,6 +355,7 @@ def run_mujoco(policy, cfg):
     rospy.Subscriber("/policy_input", Float64MultiArray, rl_result_callback, queue_size=1)
     rospy.Subscriber("/bag_state", Bool, bag_state_callback)
     rospy.Subscriber("/my_rl_state", Bool, my_rl_state_callback)
+    rospy.Subscriber("/cmd_vel", Twist, TwistCmdCallback, queue_size=1)
     cmd_pub = rospy.Publisher('/controllers/xbot_controller/policy_output', Float64MultiArray, queue_size=1)
 
     obs_pub = rospy.Publisher('/obs', Float64MultiArray, queue_size=1)
@@ -366,29 +375,36 @@ def run_mujoco(policy, cfg):
     target_q = np.zeros((cfg.env.num_actions), dtype=np.double)
     target_q_myrl = np.zeros((cfg.env.num_actions), dtype=np.double)
     action = np.zeros((cfg.env.num_actions), dtype=np.double)
+    action2 = np.zeros((cfg.env.num_actions), dtype=np.double)
+
     hist_obs = deque()
     for _ in range(cfg.env.frame_stack):
         hist_obs.append(np.zeros([1, cfg.env.num_single_obs], dtype=np.double))
 
     count_lowlevel = 0
     move_lowlevel =  0
+    my_rl_count_lowlevel = 0
     hallo_time = 0 
     shake_hand_time = 0
     all_time = 30
+    my_rl_start = False
 
         # for _ in tqdm(range(int(cfg.sim_config.sim_duration / cfg.sim_config.dt)), desc="Simulating..."):
     while not rospy.is_shutdown():
             # Obtain an observation
             start = time.time()
             q, dq, quat, v, omega, gvec,tq,acc = get_obs(data)
-            xbot_state_pub(cfg,cmd_pub,q,dq,quat,omega,tq,acc)
             q_leg = q[-cfg.env.num_actions:]
             dq_leg = dq[-cfg.env.num_actions:]
             
             # 1000hz -> 100hz
             if not my_rl:
                 if count_lowlevel % cfg.sim_config.decimation == 0:
+                    xbot_state_pub(cfg,cmd_pub,q,dq,quat,omega,tq,acc)
                     vel_x,vel_y,ang_vel_yaw = keyboard_thread.get_velocity()
+                    # vel_x=0
+                    # vel_y= 0
+                    # ang_vel_yaw = 0
                     hallo,shake_hand = keyboard_thread.get_arms_cmd()
                     print(f"vel_x:{vel_x}, vel_y:{vel_y},ang_vel_yaw:{ang_vel_yaw}")
                     print(f"hallo:{hallo},shake_hand:{shake_hand},play_bag:{play_bag},my_rl:{my_rl}")
@@ -496,12 +512,20 @@ def run_mujoco(policy, cfg):
                     target_q = np.concatenate([left_arm_joints, target_q])  # 默认沿axis=0拼接
                     # print(f"target_q:{target_q}")
             else:
+                my_rl_start = True
+                # if my_rl_count_lowlevel % 10 == 0:
+                    
                 callback_event.wait()  # 阻塞等待事件
                 callback_event.clear()  # 立即清除事件
-                vel_x,vel_y,ang_vel_yaw = keyboard_thread.get_velocity()
-                hallo,shake_hand = keyboard_thread.get_arms_cmd()
-                print(f"vel_x:{vel_x}, vel_y:{vel_y},ang_vel_yaw:{ang_vel_yaw}")
-                print(f"hallo:{hallo},shake_hand:{shake_hand},play_bag:{play_bag},my_rl:{my_rl}")
+            # vel_x,vel_y,ang_vel_yaw = keyboard_thread.get_velocity()
+            # hallo,shake_hand = keyboard_thread.get_arms_cmd()
+                vel_x=vx
+                vel_y= vy
+                ang_vel_yaw = ang
+                xbot_state_pub(cfg,cmd_pub,q,dq,quat,omega,tq,acc)
+                print(f"q:{q[-12:]}")
+                # print(f"vel_x:{vel_x}, vel_y:{vel_y},ang_vel_yaw:{ang_vel_yaw}")
+                # print(f"hallo:{hallo},shake_hand:{shake_hand},play_bag:{play_bag},my_rl:{my_rl}")
                 obs = np.zeros([1, cfg.env.num_single_obs], dtype=np.float32)
                 eu_ang = quaternion_to_euler_array(quat)
                 # quat_a = euler_to_quaternion_array(eu_ang)
@@ -520,6 +544,7 @@ def run_mujoco(policy, cfg):
                 # print(f"action0:{obs[0, 29:41]}")
                 obs[0, 41:44] = omega
                 obs[0, 44:47] = eu_ang
+                # print(f"eu_ang:{eu_ang}")
                 # obs=np.array([  0,      1,      0,      0,      0,      0.02 ,  0.028 , 0.051, -0.008, -0.029,
                 #                -0.024,  0.01,  -0.007,  0.058,  0.002, -0.086, -0.014, -0.001, -0,     -0.001,
                 #                -0.001,  0.005,  0.006, -0.,    -0.001,  0.001, -0.002, -0.012,  0.004, -0.073,
@@ -536,44 +561,80 @@ def run_mujoco(policy, cfg):
 
                 hist_obs.append(obs)
                 hist_obs.popleft()
+
+                policy_input = np.zeros([1, cfg.env.num_observations], dtype=np.float32)
+                for i in range(cfg.env.frame_stack):
+                    policy_input[0, i * cfg.env.num_single_obs : (i + 1) * cfg.env.num_single_obs] = hist_obs[i][0, :]
+                    action2[:] = policy(torch.tensor(policy_input))[0].detach().numpy()
+                action2 = np.clip(action, -cfg.normalization.clip_actions, cfg.normalization.clip_actions)
                 action = rl_q * 4
+                print(f"action_diff:{action-action2}")
                 target_q_myrl = action * cfg.control.action_scale
                 left_arm_joints = np.zeros((7), dtype=np.double)
                 right_arm_joints = np.zeros((7), dtype=np.double)
                 print(f"rl_q:{rl_q}")
                 target_q_myrl = np.concatenate([right_arm_joints, target_q_myrl])  # 默认沿axis=0拼接
                 target_q_myrl = np.concatenate([left_arm_joints, target_q_myrl])  # 默认沿axis=0拼接
-                # print(f"target_q:{target_q[-12:]}")
-                # print(f"target_q_myrl:{target_q_myrl[-12:]}")
-                # print(f"target_diff:{target_q[-12:]-target_q_myrl[-12:]}")
+                    # print(f"target_q:{target_q[-12:]}")
+                    # print(f"target_q_myrl:{target_q_myrl[-12:]}")
+                    # print(f"target_diff:{target_q[-12:]-target_q_myrl[-12:]}")
+            if my_rl:
+                for i in range(9):
+                    q, dq, quat, v, omega, gvec,tq,acc = get_obs(data)
+                    target_dq = np.zeros((all_joints), dtype=np.double)
+                    # tau = np.zeros((all_joints), dtype=np.double)
+                    # Generate PD control
+                    if not my_rl:
+                        tau = pd_control(target_q[-all_joints:], q[-all_joints:], cfg.robot_config.kps[-all_joints:],
+                                        target_dq[-all_joints:], dq[-all_joints:], cfg.robot_config.kds[-all_joints:])  # Calc torques
+                    else:
+                        # arm_tor = np.zeros((cfg.sim_config.num_arms_joints), dtype=np.double)
+                        # rl_all_tor = np.concatenate([arm_tor, rl_tor])
+                        # print(f"rl_all_tor:{rl_all_tor}")
+                        tau = pd_control(target_q_myrl[-all_joints:], q[-all_joints:], cfg.robot_config.kps[-all_joints:],
+                                        target_dq[-all_joints:], dq[-all_joints:], cfg.robot_config.kds[-all_joints:])
+                        # print(f"tau_myrl:{tau_myrl}")
+                
+                    tau_limit = 200. * np.ones(all_joints, dtype=np.double)
+                    tau = np.clip(tau, -tau_limit, tau_limit)  # Clamp torques
+                    # print(f"tau:{tau}")
+                    data.ctrl = tau
+                    start2 = time.time() 
 
-            target_dq = np.zeros((all_joints), dtype=np.double)
-            # tau = np.zeros((all_joints), dtype=np.double)
-            # Generate PD control
-            if not my_rl:
-                tau = pd_control(target_q[-all_joints:], q[-all_joints:], cfg.robot_config.kps[-all_joints:],
-                                target_dq[-all_joints:], dq[-all_joints:], cfg.robot_config.kds[-all_joints:])  # Calc torques
-            else:
-                # arm_tor = np.zeros((cfg.sim_config.num_arms_joints), dtype=np.double)
-                # rl_all_tor = np.concatenate([arm_tor, rl_tor])
-                # print(f"rl_all_tor:{rl_all_tor}")
-                tau = pd_control(target_q_myrl[-all_joints:], q[-all_joints:], cfg.robot_config.kps[-all_joints:],
-                                target_dq[-all_joints:], dq[-all_joints:], cfg.robot_config.kds[-all_joints:])
-                # print(f"tau_myrl:{tau_myrl}")
+                    mujoco.mj_step(model, data)
         
-            tau_limit = 200. * np.ones(all_joints, dtype=np.double)
-            tau = np.clip(tau, -tau_limit, tau_limit)  # Clamp torques
-            # print(f"tau:{tau}")
-            data.ctrl = tau
-            start2 = time.time() 
-            mujoco.mj_step(model, data)
-            viewer.render()
-            count_lowlevel += 1
-            move_lowlevel += 1
+                    viewer.render()
+                    count_lowlevel += 1
+                    move_lowlevel += 1
+            else:
+                target_dq = np.zeros((all_joints), dtype=np.double)
+                # tau = np.zeros((all_joints), dtype=np.double)
+                # Generate PD control
+                if not my_rl:
+                    tau = pd_control(target_q[-all_joints:], q[-all_joints:], cfg.robot_config.kps[-all_joints:],
+                                    target_dq[-all_joints:], dq[-all_joints:], cfg.robot_config.kds[-all_joints:])  # Calc torques
+                else:
+                    # arm_tor = np.zeros((cfg.sim_config.num_arms_joints), dtype=np.double)
+                    # rl_all_tor = np.concatenate([arm_tor, rl_tor])
+                    # print(f"rl_all_tor:{rl_all_tor}")
+                    tau = pd_control(target_q_myrl[-all_joints:], q[-all_joints:], cfg.robot_config.kps[-all_joints:],
+                                    target_dq[-all_joints:], dq[-all_joints:], cfg.robot_config.kds[-all_joints:])
+                    # print(f"tau_myrl:{tau_myrl}")
             
+                tau_limit = 200. * np.ones(all_joints, dtype=np.double)
+                tau = np.clip(tau, -tau_limit, tau_limit)  # Clamp torques
+                # print(f"tau:{tau}")
+                data.ctrl = tau
+                start2 = time.time() 
+
+                mujoco.mj_step(model, data)
+
+                viewer.render()
+                count_lowlevel += 1
+                move_lowlevel += 1
 
             end = time.time()
-            # print(f"执行耗时：{end - start:.7f}秒")
+            print(f"执行耗时：{end - start:.7f}秒")
 
             # print(f"仿真耗时：{end - start2:.7f}秒")
             # play_bag = False
